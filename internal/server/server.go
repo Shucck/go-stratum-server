@@ -4,42 +4,56 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // Job represents a mining job.
 type Job struct {
-	ID   string `json:"id"`
-	Data string `json:"data"`
+	ID         string `json:"id"`
+	Data       string `json:"data"`
+	Difficulty int    `json:"difficulty"`
 }
 
 // Solution represents a mining solution.
 type Solution struct {
-	MinerID string `json:"minerId"`
-	JobID   string `json:"jobId"`
-	Nonce   string `json:"nonce"`
-	Result  string `json:"result"`
+	MinerID   string `json:"minerId"`
+	JobID     string `json:"jobId"`
+	Nonce     string `json:"nonce"`
+	Result    string `json:"result"`
+	Timestamp int64  `json:"timestamp"`
 }
 
 // StratumServer represents a Stratum mining server.
 type StratumServer struct {
-	host      string
-	port      int
-	networks  map[string]map[string]net.Conn
-	jobs      map[string]Job
-	solutions map[string]Solution
-	mutex     sync.Mutex
+	host              string
+	port              int
+	network           string // Network for all miners
+	miners            map[string]net.Conn
+	jobQueue          []Job
+	solutions         map[string]Solution
+	mutex             sync.Mutex
+	connectionTimeout time.Duration // Connection timeout duration
+	workerPool        chan struct{} // Worker pool for job processing
+	maxWorkers        int           // Maximum number of worker goroutines
+	difficulty        int           // Current share difficulty
 }
 
 // NewStratumServer creates a new Stratum server.
-func NewStratumServer(host string, port int) *StratumServer {
+func NewStratumServer(host string, port int, network string, connectionTimeout time.Duration, maxWorkers int, difficulty int) *StratumServer {
 	return &StratumServer{
-		host:      host,
-		port:      port,
-		networks:  make(map[string]map[string]net.Conn),
-		jobs:      make(map[string]Job),
-		solutions: make(map[string]Solution),
+		host:              host,
+		port:              port,
+		network:           network,
+		miners:            make(map[string]net.Conn),
+		jobQueue:          []Job{},
+		solutions:         make(map[string]Solution),
+		mutex:             sync.Mutex{},
+		connectionTimeout: connectionTimeout,
+		workerPool:        make(chan struct{}, maxWorkers),
+		difficulty:        difficulty,
 	}
 }
 
@@ -47,19 +61,38 @@ func NewStratumServer(host string, port int) *StratumServer {
 func (s *StratumServer) Start() {
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", s.host, s.port))
 	if err != nil {
-		fmt.Println("Error starting server:", err)
-		return
+		log.Fatalf("Error starting server: %v", err)
 	}
 	defer ln.Close()
-	fmt.Printf("Stratum server started on %s:%d\n", s.host, s.port)
+	log.Printf("Stratum server started on %s:%d\n", s.host, s.port)
+
+	// Start a goroutine to check for connection timeouts
+	go s.checkConnectionTimeouts()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Println("Error accepting connection:", err)
+			log.Printf("Error accepting connection: %v", err)
 			continue
 		}
 		go s.handleConnection(conn)
+	}
+}
+
+// checkConnectionTimeouts checks for idle connections and closes them.
+func (s *StratumServer) checkConnectionTimeouts() {
+	for {
+		time.Sleep(s.connectionTimeout)
+		s.mutex.Lock()
+		for minerID, conn := range s.miners {
+			lastActivity := time.Now().Sub(conn.(*net.TCPConn).RemoteAddr().(*net.TCPAddr).Timestamp)
+			if lastActivity > s.connectionTimeout {
+				conn.Close()
+				delete(s.miners, minerID)
+				log.Printf("Closed idle connection for miner %s\n", minerID)
+			}
+		}
+		s.mutex.Unlock()
 	}
 }
 
@@ -71,13 +104,13 @@ func (s *StratumServer) handleConnection(conn net.Conn) {
 	for scanner.Scan() {
 		var request map[string]interface{}
 		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
-			fmt.Println("Error decoding request:", err)
+			log.Printf("Error decoding request: %v", err)
 			continue
 		}
 
 		method, ok := request["method"].(string)
 		if !ok {
-			fmt.Println("Invalid method in request")
+			log.Println("Invalid method in request")
 			continue
 		}
 
@@ -89,12 +122,12 @@ func (s *StratumServer) handleConnection(conn net.Conn) {
 		case "mining.submit":
 			s.handleSubmit(conn, request)
 		default:
-			fmt.Println("Unsupported method:", method)
+			log.Printf("Unsupported method: %s", method)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		fmt.Println("Error reading from connection:", err)
+		log.Printf("Error reading from connection: %v", err)
 	}
 }
 
@@ -120,20 +153,10 @@ func (s *StratumServer) handleAuthorize(conn net.Conn, request map[string]interf
 		return
 	}
 
-	// Assume network information is provided in params[1]
-	network, ok := params[1].(string)
-	if !ok {
-		s.sendError(conn, request["id"], "Invalid network")
-		return
-	}
-
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if _, ok := s.networks[network]; !ok {
-		s.networks[network] = make(map[string]net.Conn)
-	}
-	s.networks[network][minerID] = conn
+	s.miners[minerID] = conn
 
 	s.sendResponse(conn, map[string]interface{}{"id": request["id"], "result": true})
 }
@@ -169,10 +192,17 @@ func (s *StratumServer) handleSubmit(conn net.Conn, request map[string]interface
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
+	// Check if miner is authorized
+	if _, ok := s.miners[minerID]; !ok {
+		s.sendError(conn, request["id"], "Miner is not authorized")
+		return
+	}
+
+	// Process the submission
 	if _, ok := s.solutions[minerID]; !ok {
 		s.solutions[minerID] = Solution{}
 	}
-	s.solutions[minerID] = Solution{MinerID: minerID, JobID: jobID, Nonce: nonce, Result: result}
+	s.solutions[minerID] = Solution{MinerID: minerID, JobID: jobID, Nonce: nonce, Result: result, Timestamp: time.Now().Unix()}
 
 	s.sendResponse(conn, map[string]interface{}{"id": request["id"], "result": true})
 }
@@ -181,12 +211,12 @@ func (s *StratumServer) handleSubmit(conn net.Conn, request map[string]interface
 func (s *StratumServer) sendResponse(conn net.Conn, response map[string]interface{}) {
 	data, err := json.Marshal(response)
 	if err != nil {
-		fmt.Println("Error encoding response:", err)
+		log.Printf("Error encoding response: %v", err)
 		return
 	}
 	_, err = conn.Write(data)
 	if err != nil {
-		fmt.Println("Error sending response:", err)
+		log.Printf("Error sending response: %v", err)
 	}
 }
 
@@ -197,9 +227,4 @@ func (s *StratumServer) sendError(conn net.Conn, id interface{}, message string)
 		"error": message,
 	}
 	s.sendResponse(conn, response)
-}
-
-func main() {
-	server := NewStratumServer("localhost", 3333)
-	server.Start()
 }

@@ -1,0 +1,11 @@
+[
+    {
+      "name": "Network1",
+      "params": ["0x12345678", 30]
+    },
+    {
+      "name": "Network2",
+      "params": ["0xabcdef12", 45]
+    }
+  ]
+  
