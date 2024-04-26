@@ -39,6 +39,7 @@ type StratumServer struct {
 	workerPool        chan struct{} // Worker pool for job processing
 	maxWorkers        int           // Maximum number of worker goroutines
 	difficulty        int           // Current share difficulty
+	difficultyChannel chan int      // Channel to broadcast updated difficulty
 }
 
 // NewStratumServer creates a new Stratum server.
@@ -54,6 +55,7 @@ func NewStratumServer(host string, port int, network string, connectionTimeout t
 		connectionTimeout: connectionTimeout,
 		workerPool:        make(chan struct{}, maxWorkers),
 		difficulty:        difficulty,
+		difficultyChannel: make(chan int),
 	}
 }
 
@@ -68,6 +70,9 @@ func (s *StratumServer) Start() {
 
 	// Start a goroutine to check for connection timeouts
 	go s.checkConnectionTimeouts()
+
+	// Start a goroutine to broadcast difficulty updates
+	go s.broadcastDifficulty()
 
 	for {
 		conn, err := ln.Accept()
@@ -227,4 +232,24 @@ func (s *StratumServer) sendError(conn net.Conn, id interface{}, message string)
 		"error": message,
 	}
 	s.sendResponse(conn, response)
+}
+
+// broadcastDifficulty sends the updated difficulty to all connected miners.
+func (s *StratumServer) broadcastDifficulty() {
+	for newDiff := range s.difficultyChannel {
+		// Construct difficulty update message
+		response := map[string]interface{}{
+			"method": "mining.set_difficulty",
+			"params": []interface{}{newDiff},
+		}
+
+		// Broadcast difficulty update to all miners
+		s.mutex.Lock()
+		for _, conn := range s.miners {
+			if err := json.NewEncoder(conn).Encode(response); err != nil {
+				log.Printf("Error broadcasting difficulty update: %v", err)
+			}
+		}
+		s.mutex.Unlock()
+	}
 }
