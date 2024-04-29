@@ -12,9 +12,8 @@ import (
 
 // Job represents a mining job.
 type Job struct {
-	ID         string `json:"id"`
-	Data       string `json:"data"`
-	Difficulty int    `json:"difficulty"`
+	ID   string `json:"id"`
+	Data string `json:"data"`
 }
 
 // Solution represents a mining solution.
@@ -38,12 +37,11 @@ type StratumServer struct {
 	connectionTimeout time.Duration // Connection timeout duration
 	workerPool        chan struct{} // Worker pool for job processing
 	maxWorkers        int           // Maximum number of worker goroutines
-	difficulty        int           // Current share difficulty
-	difficultyChannel chan int      // Channel to broadcast updated difficulty
+	solutionChannel   chan Solution // Channel to provide updated solutions
 }
 
 // NewStratumServer creates a new Stratum server.
-func NewStratumServer(host string, port int, network string, connectionTimeout time.Duration, maxWorkers int, difficulty int) *StratumServer {
+func NewStratumServer(host string, port int, network string, connectionTimeout time.Duration, maxWorkers int) *StratumServer {
 	return &StratumServer{
 		host:              host,
 		port:              port,
@@ -54,8 +52,7 @@ func NewStratumServer(host string, port int, network string, connectionTimeout t
 		mutex:             sync.Mutex{},
 		connectionTimeout: connectionTimeout,
 		workerPool:        make(chan struct{}, maxWorkers),
-		difficulty:        difficulty,
-		difficultyChannel: make(chan int),
+		solutionChannel:   make(chan Solution, 100), // Buffered channel with capacity 100
 	}
 }
 
@@ -70,9 +67,6 @@ func (s *StratumServer) Start() {
 
 	// Start a goroutine to check for connection timeouts
 	go s.checkConnectionTimeouts()
-
-	// Start a goroutine to broadcast difficulty updates
-	go s.broadcastDifficulty()
 
 	for {
 		conn, err := ln.Accept()
@@ -209,6 +203,8 @@ func (s *StratumServer) handleSubmit(conn net.Conn, request map[string]interface
 	}
 	s.solutions[minerID] = Solution{MinerID: minerID, JobID: jobID, Nonce: nonce, Result: result, Timestamp: time.Now().Unix()}
 
+	// Send solution to the solution channel
+	s.SendSolution(s.solutions[minerID])
 	s.sendResponse(conn, map[string]interface{}{"id": request["id"], "result": true})
 }
 
@@ -234,22 +230,50 @@ func (s *StratumServer) sendError(conn net.Conn, id interface{}, message string)
 	s.sendResponse(conn, response)
 }
 
-// broadcastDifficulty sends the updated difficulty to all connected miners.
-func (s *StratumServer) broadcastDifficulty() {
-	for newDiff := range s.difficultyChannel {
-		// Construct difficulty update message
-		response := map[string]interface{}{
-			"method": "mining.set_difficulty",
-			"params": []interface{}{newDiff},
-		}
+// SendJob sends a job to a miner based on the miner's ID.
+func (s *StratumServer) SendJob(job Job, minerID string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 
-		// Broadcast difficulty update to all miners
-		s.mutex.Lock()
-		for _, conn := range s.miners {
-			if err := json.NewEncoder(conn).Encode(response); err != nil {
-				log.Printf("Error broadcasting difficulty update: %v", err)
-			}
-		}
-		s.mutex.Unlock()
+	conn, ok := s.miners[minerID]
+	if !ok {
+		log.Printf("Miner with ID %s not found", minerID)
+		return
 	}
+
+	jobData, err := json.Marshal(job)
+	if err != nil {
+		log.Printf("Error encoding job data: %v", err)
+		return
+	}
+
+	message := map[string]interface{}{
+		"id":     "job",
+		"method": "mining.notify",
+		"params": []interface{}{jobData},
+	}
+
+	if err := json.NewEncoder(conn).Encode(message); err != nil {
+		log.Printf("Error sending job to miner %s: %v", minerID, err)
+		return
+	}
+}
+
+// SetDifficulty sets the difficulty for a specific miner.
+func (s *StratumServer) SetDifficulty(bits int, minerID string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.miners[minerID].Difficulty = bits
+}
+
+// GetMinersLength returns the number of connected hardware miners.
+func (s *StratumServer) GetMinersLength() uint32 {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return uint32(len(s.miners))
+}
+
+// SendSolution sends a solution to the solution channel.
+func (s *StratumServer) SendSolution(solution Solution) {
+	s.solutionChannel <- solution
 }
