@@ -2,18 +2,95 @@ package server
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+// BlockHeader represents the block header structure.
+type BlockHeader struct {
+	Version        uint32 // Block version
+	PrevBlockHash  string // Hash of the previous block
+	MerkleRootHash string // Merkle root hash of transactions
+	Timestamp      uint32 // Block timestamp
+	Nonce          uint32 // Nonce used for mining
+}
+
 // Job represents a mining job.
 type Job struct {
-	ID   string `json:"id"`
-	Data string `json:"data"`
+	ID   string `json:"id"`   // Job ID
+	Data string `json:"data"` // Job data (block header in hexadecimal format)
+}
+
+var (
+	jobCounter uint64 // Atomic counter for generating job IDs
+)
+
+// NewJob creates a new mining job with the provided block header.
+func NewJob(header BlockHeader) *Job {
+	// Serialize block header to hexadecimal format
+	data, err := json.Marshal(header)
+	if err != nil {
+		log.Printf("Error encoding block header: %v", err)
+		return nil
+	}
+	hexData := hex.EncodeToString(data)
+
+	return &Job{
+		ID:   generateJobID(), // Generate unique job ID
+		Data: hexData,         // Set data field as hexadecimal representation of block header
+	}
+}
+
+// GenerateBlockHeader generates a new block header for mining.
+func GenerateBlockHeader(prevBlockHash string) BlockHeader {
+	return BlockHeader{
+		Version:        1,                         // Example: Set block version
+		PrevBlockHash:  prevBlockHash,             // Set previous block hash
+		MerkleRootHash: "dummy-merkle-root-hash",  // Example: Set Merkle root hash of transactions
+		Timestamp:      uint32(time.Now().Unix()), // Set current timestamp
+		Nonce:          0,                         // Initialize nonce to 0
+	}
+}
+
+// NonceIsValid checks if the given nonce produces a valid block hash based on the target difficulty.
+func NonceIsValid(header BlockHeader, targetDifficulty uint32) bool {
+	// Serialize block header to hexadecimal format
+	data, err := json.Marshal(header)
+	if err != nil {
+		log.Printf("Error encoding block header: %v", err)
+		return false
+	}
+	hexData := hex.EncodeToString(data)
+
+	// Concatenate nonce to block header
+	headerWithNonce := hexData + intToHex(header.Nonce)
+
+	// Calculate double SHA-256 hash of concatenated data
+	hash := sha256.Sum256([]byte(headerWithNonce))
+	hashString := hex.EncodeToString(hash[:])
+
+	// Check if hash meets the target difficulty
+	return hashString[:targetDifficulty/4] == "0000" // Example: Check if hash starts with four leading zeros
+}
+
+// intToHex converts an integer to a hexadecimal string.
+func intToHex(n uint32) string {
+	return hex.EncodeToString([]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)})
+}
+
+// generateJobID generates a unique job ID.
+func generateJobID() string {
+	// Generate a unique job ID using a combination of timestamp and an atomic counter
+	id := atomic.AddUint64(&jobCounter, 1)
+	timestamp := time.Now().UnixNano()
+	return fmt.Sprintf("job-%d-%d", timestamp, id)
 }
 
 // Solution represents a mining solution.
@@ -263,7 +340,26 @@ func (s *StratumServer) SendJob(job Job, minerID string) {
 func (s *StratumServer) SetDifficulty(bits int, minerID string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	s.miners[minerID].Difficulty = bits
+
+	// Check if the miner exists
+	conn, ok := s.miners[minerID]
+	if !ok {
+		log.Printf("Miner with ID %s not found", minerID)
+		return
+	}
+
+	// Construct a response to set the difficulty
+	response := map[string]interface{}{
+		"id":     "set_difficulty",
+		"method": "mining.set_difficulty",
+		"params": []interface{}{bits},
+	}
+
+	// Encode and send the response to the miner
+	if err := json.NewEncoder(conn).Encode(response); err != nil {
+		log.Printf("Error setting difficulty for miner %s: %v", minerID, err)
+		return
+	}
 }
 
 // GetMinersLength returns the number of connected hardware miners.
