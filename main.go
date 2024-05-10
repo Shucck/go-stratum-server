@@ -4,7 +4,7 @@ import (
 	"log"
 	"time"
 
-	"https://github.com/Shucck/go-stratum-server/server"
+	"https://github.com/Shucck/go-stratum-server/tree/main/server"
 )
 
 func main() {
