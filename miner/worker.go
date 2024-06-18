@@ -1,134 +1,51 @@
-package server
+package main
 
-import (
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"log"
-	"sync/atomic"
-	"time"
-)
-
-// Job represents a mining job.
-type Job struct {
-	ID   string `json:"id"`
-	Data string `json:"data"`
+// Solution represents a solution submitted by a miner.
+type Solution struct {
+	MinerID   string
+	JobID     string
+	Nonce     string
+	Result    string
+	Timestamp int64
 }
 
-var (
-	jobCounter uint64 // Atomic counter for generating job IDs
-)
-
-// NewJob creates a new mining job with the provided block header.
-package server
-
-import (
-    "encoding/hex"
-    "encoding/json"
-    "fmt"
-    "log"
-    "sync/atomic"
-    "time"
-)
-
-// Define the BlockHeader type here
-type BlockHeader struct {
-    // Define the fields of the BlockHeader
+// Worker represents a worker that processes mining jobs.
+type Worker struct {
+	ID              string
+	SolutionChannel chan Solution
+	StopChannel     chan bool
 }
 
-// Job represents a mining job.
-type Job struct {
-    ID   string `json:"id"`
-    Data string `json:"data"`
-}
-
-var (
-    jobCounter uint64 // Atomic counter for generating job IDs
-)
-
-// generateJobID generates a unique job ID.
-func generateJobID() string {
-    id := atomic.AddUint64(&jobCounter, 1)
-    timestamp := time.Now().UnixNano()
-    return fmt.Sprintf("job-%d-%d", timestamp, id)
-}
-
-// NewJob creates a new mining job with the provided block header.
-func NewJob(header BlockHeader) *Job {
-    data, err := json.Marshal(header)
-    if err != nil {
-        log.Printf("Error encoding block header: %v", err)
-        return nil
-    }
-    hexData := hex.EncodeToString(data)
-
-    return &Job{
-        ID:   generateJobID(),
-        Data: hexData,
-    }
-}
-
-import (
-    "encoding/hex"
-    "encoding/json"
-    "fmt"
-    "log"
-    "sync/atomic"
-    "time"
-)
-
-// Define the BlockHeader type here if it's not defined in another package
-// type BlockHeader struct {
-// 	// Define the fields of the BlockHeader
-// }
-
-// Job represents a mining job.
-type Job struct {
-    ID   string `json:"id"`
-    Data string `json:"data"`
-}
-
-var (
-    jobCounter uint64 // Atomic counter for generating job IDs
-)
-
-// NewJob creates a new mining job with the provided block header.
-func NewJob(header BlockHeader) *Job {
-    data, err := json.Marshal(header)
-    if err!= nil {
-        log.Printf("Error encoding block header: %v", err)
-        return nil
-    }
-    hexData := hex.EncodeToString(data)
-
-    return &Job{
-        ID:   generateJobID(),
-        Data: hexData,
-    }
-}
-
-// generateJobID generates a unique job ID.
-func generateJobID() string {
-    id := atomic.AddUint64(&jobCounter, 1)
-    timestamp := time.Now().UnixNano()
-    return fmt.Sprintf("job-%d-%d", timestamp, id)
-}
-	data, err := json.Marshal(header)
-	if err != nil {
-		log.Printf("Error encoding block header: %v", err)
-		return nil
-	}
-	hexData := hex.EncodeToString(data)
-
-	return &Job{
-		ID:   generateJobID(),
-		Data: hexData,
+// NewWorker creates a new worker.
+func NewWorker(id string, solutionChannel chan Solution) Worker {
+	return Worker{
+		ID:              id,
+		SolutionChannel: solutionChannel,
+		StopChannel:     make(chan bool),
 	}
 }
 
-// generateJobID generates a unique job ID.
-func generateJobID() string {
-	id := atomic.AddUint64(&jobCounter, 1)
-	timestamp := time.Now().UnixNano()
-	return fmt.Sprintf("job-%d-%d", timestamp, id)
+// Start starts the worker to process solutions.
+func (w *Worker) Start() {
+	go func() {
+		for {
+			select {
+			case solution := <-w.SolutionChannel:
+				w.processSolution(solution)
+			case <-w.StopChannel:
+				return
+			}
+		}
+	}()
+}
+
+// Stop stops the worker from processing solutions.
+func (w *Worker) Stop() {
+	w.StopChannel <- true
+}
+
+// processSolution processes a solution submitted by a miner.
+func (w *Worker) processSolution(solution Solution) {
+	// Process the solution, for example, validate it and store it.
+	log.Printf("Worker %s processing solution from miner %s for job %s\n", w.ID, solution.MinerID, solution.JobID)
 }

@@ -1,4 +1,4 @@
-package server
+package main
 
 import (
 	"bufio"
@@ -7,7 +7,18 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+// Job represents a mining job.
+type Job struct {
+	ID   string `json:"id"`
+	Data string `json:"data"`
+}
+
+var (
+	jobCounter uint64
 )
 
 // StratumServer represents a Stratum mining server.
@@ -15,7 +26,7 @@ type StratumServer struct {
 	host              string
 	port              int
 	network           string
-	miners            map[string]*Miner
+	miners            map[string]net.Conn
 	jobQueue          []Job
 	solutions         map[string]Solution
 	mutex             sync.Mutex
@@ -23,6 +34,7 @@ type StratumServer struct {
 	workerPool        chan struct{}
 	maxWorkers        int
 	solutionChannel   chan Solution
+	auth              map[string]string
 }
 
 // NewStratumServer creates a new Stratum server.
@@ -31,19 +43,20 @@ func NewStratumServer(host string, port int, network string, connectionTimeout t
 		host:              host,
 		port:              port,
 		network:           network,
-		miners:            make(map[string]*Miner),
+		miners:            make(map[string]net.Conn),
 		jobQueue:          []Job{},
 		solutions:         make(map[string]Solution),
 		mutex:             sync.Mutex{},
 		connectionTimeout: connectionTimeout,
 		workerPool:        make(chan struct{}, maxWorkers),
 		solutionChannel:   make(chan Solution, 100),
+		auth:              make(map[string]string),
 	}
 }
 
 // Start starts the Stratum server.
 func (s *StratumServer) Start() {
-	ln, err := net.Listen(s.network, fmt.Sprintf("%s:%d", s.host, s.port))
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", s.host, s.port))
 	if err != nil {
 		log.Fatalf("Error starting server: %v", err)
 	}
@@ -59,6 +72,23 @@ func (s *StratumServer) Start() {
 			continue
 		}
 		go s.handleConnection(conn)
+	}
+}
+
+// checkConnectionTimeouts checks for idle connections and closes them.
+func (s *StratumServer) checkConnectionTimeouts() {
+	for {
+		time.Sleep(s.connectionTimeout)
+		s.mutex.Lock()
+		for minerID, conn := range s.miners {
+			lastActivity := time.Now().Sub(conn.(*net.TCPConn).RemoteAddr().(*net.TCPAddr).Timestamp)
+			if lastActivity > s.connectionTimeout {
+				conn.Close()
+				delete(s.miners, minerID)
+				log.Printf("Closed idle connection for miner %s\n", minerID)
+			}
+		}
+		s.mutex.Unlock()
 	}
 }
 
@@ -109,7 +139,7 @@ func (s *StratumServer) handleSubscribe(conn net.Conn, request map[string]interf
 // handleAuthorize handles a mining authorization request.
 func (s *StratumServer) handleAuthorize(conn net.Conn, request map[string]interface{}) {
 	params, ok := request["params"].([]interface{})
-	if !ok || len(params) == 0 {
+	if !ok || len(params) != 2 {
 		s.sendError(conn, request["id"], "Invalid params")
 		return
 	}
@@ -118,11 +148,22 @@ func (s *StratumServer) handleAuthorize(conn net.Conn, request map[string]interf
 		s.sendError(conn, request["id"], "Invalid miner ID")
 		return
 	}
+	password, ok := params[1].(string)
+	if !ok {
+		s.sendError(conn, request["id"], "Invalid password")
+		return
+	}
+
+	storedPassword, found := s.auth[minerID]
+	if !found || storedPassword != password {
+		s.sendError(conn, request["id"], "Invalid credentials")
+		return
+	}
 
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	s.miners[minerID] = NewMiner(minerID, conn)
+	s.miners[minerID] = conn
 
 	s.sendResponse(conn, map[string]interface{}{"id": request["id"], "result": true})
 }
@@ -158,19 +199,16 @@ func (s *StratumServer) handleSubmit(conn net.Conn, request map[string]interface
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	// Check if miner is authorized
 	if _, ok := s.miners[minerID]; !ok {
 		s.sendError(conn, request["id"], "Miner is not authorized")
 		return
 	}
 
-	// Process the submission
 	if _, ok := s.solutions[minerID]; !ok {
 		s.solutions[minerID] = Solution{}
 	}
 	s.solutions[minerID] = Solution{MinerID: minerID, JobID: jobID, Nonce: nonce, Result: result, Timestamp: time.Now().Unix()}
 
-	// Send solution to the solution channel
 	s.SendSolution(s.solutions[minerID])
 	s.sendResponse(conn, map[string]interface{}{"id": request["id"], "result": true})
 }
@@ -202,7 +240,7 @@ func (s *StratumServer) SendJob(job Job, minerID string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	miner, ok := s.miners[minerID]
+	conn, ok := s.miners[minerID]
 	if !ok {
 		log.Printf("Miner with ID %s not found", minerID)
 		return
@@ -220,7 +258,7 @@ func (s *StratumServer) SendJob(job Job, minerID string) {
 		"params": []interface{}{jobData},
 	}
 
-	if err := json.NewEncoder(miner.Connection).Encode(message); err != nil {
+	if err := json.NewEncoder(conn).Encode(message); err != nil {
 		log.Printf("Error sending job to miner %s: %v", minerID, err)
 		return
 	}
@@ -231,7 +269,7 @@ func (s *StratumServer) SetDifficulty(bits int, minerID string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	miner, ok := s.miners[minerID]
+	conn, ok := s.miners[minerID]
 	if !ok {
 		log.Printf("Miner with ID %s not found", minerID)
 		return
@@ -243,7 +281,7 @@ func (s *StratumServer) SetDifficulty(bits int, minerID string) {
 		"params": []interface{}{bits},
 	}
 
-	if err := json.NewEncoder(miner.Connection).Encode(response); err != nil {
+	if err := json.NewEncoder(conn).Encode(response); err != nil {
 		log.Printf("Error setting difficulty for miner %s: %v", minerID, err)
 		return
 	}
@@ -261,18 +299,11 @@ func (s *StratumServer) SendSolution(solution Solution) {
 	s.solutionChannel <- solution
 }
 
-// checkConnectionTimeouts checks for idle connections and closes them.
-func (s *StratumServer) checkConnectionTimeouts() {
-	for {
-		time.Sleep(s.connectionTimeout)
-		s.mutex.Lock()
-		for minerID, miner := range s.miners {
-			if miner.IsInactive(s.connectionTimeout) {
-				miner.Connection.Close()
-				delete(s.miners, minerID)
-				log.Printf("Closed idle connection for miner %s\n", minerID)
-			}
-		}
-		s.mutex.Unlock()
-	}
+func main() {
+	server := NewStratumServer("127.0.0.1", 3333, "tcp", 10*time.Minute, 10)
+
+	server.auth["miner1"] = "password1"
+	server.auth["miner2"] = "password2"
+
+	server.Start()
 }
