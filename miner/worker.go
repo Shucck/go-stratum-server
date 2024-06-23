@@ -1,51 +1,161 @@
 package main
 
-// Solution represents a solution submitted by a miner.
-type Solution struct {
-	MinerID   string
-	JobID     string
-	Nonce     string
-	Result    string
-	Timestamp int64
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"log"
+	"math/rand"
+	"net"
+	"sync"
+	"time"
+)
+
+type Job struct {
+	ID   string `json:"id"`
+	Data string `json:"data"`
 }
 
-// Worker represents a worker that processes mining jobs.
-type Worker struct {
-	ID              string
-	SolutionChannel chan Solution
-	StopChannel     chan bool
+type Miner struct {
+	ID     string
+	Server string
+	Port   int
+	Conn   net.Conn
+	Jobs   chan Job
 }
 
-// NewWorker creates a new worker.
-func NewWorker(id string, solutionChannel chan Solution) Worker {
-	return Worker{
-		ID:              id,
-		SolutionChannel: solutionChannel,
-		StopChannel:     make(chan bool),
+func NewMiner(id, server string, port int) *Miner {
+	return &Miner{
+		ID:     id,
+		Server: server,
+		Port:   port,
+		Jobs:   make(chan Job, 10),
 	}
 }
 
-// Start starts the worker to process solutions.
-func (w *Worker) Start() {
-	go func() {
-		for {
-			select {
-			case solution := <-w.SolutionChannel:
-				w.processSolution(solution)
-			case <-w.StopChannel:
-				return
-			}
+//connects to the Stratum server.
+func (m *Miner) Connect() error {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", m.Server, m.Port))
+	if err != nil {
+		return err
+	}
+	m.Conn = conn
+	return nil
+}
+
+func (m *Miner) Subscribe() error {
+	request := map[string]interface{}{
+		"id":     1,
+		"method": "mining.subscribe",
+		"params": []interface{}{},
+	}
+	return m.sendRequest(request)
+}
+
+func (m *Miner) Authorize() error {
+	request := map[string]interface{}{
+		"id":     2,
+		"method": "mining.authorize",
+		"params": []interface{}{m.ID, "stratumServer"},
+	}
+	return m.sendRequest(request)
+}
+
+func (m *Miner) Start() {
+	go m.receiveJobs()
+	for job := range m.Jobs {
+		m.mine(job)
+	}
+}
+
+func (m *Miner) receiveJobs() {
+	buffer := make([]byte, 4096)
+	for {
+		n, err := m.Conn.Read(buffer)
+		if err != nil {
+			log.Printf("Error reading from server: %v", err)
+			close(m.Jobs)
+			return
 		}
-	}()
+
+		var job Job
+		err = json.Unmarshal(buffer[:n], &job)
+		if err != nil {
+			log.Printf("Error unmarshalling job: %v", err)
+			continue
+		}
+
+		m.Jobs <- job
+	}
 }
 
-// Stop stops the worker from processing solutions.
-func (w *Worker) Stop() {
-	w.StopChannel <- true
+func (m *Miner) mine(job Job) {
+	var wg sync.WaitGroup
+	numWorkers := 4
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			nonce := rand.Uint32()
+			for {
+				select {
+				case <-time.After(10 * time.Second):
+					hash := sha256.Sum256([]byte(job.Data + string(nonce)))
+					if isHashValid(hash) {
+						result := hex.EncodeToString(hash[:])
+						m.Submit(job.ID, string(nonce), result)
+						return
+					}
+					nonce++
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
-// processSolution processes a solution submitted by a miner.
-func (w *Worker) processSolution(solution Solution) {
-	// Process the solution, for example, validate it and store it.
-	log.Printf("Worker %s processing solution from miner %s for job %s\n", w.ID, solution.MinerID, solution.JobID)
+func isHashValid(hash [32]byte) bool {
+	target := "0000"
+	return hex.EncodeToString(hash[:])[:len(target)] == target
+}
+
+//submits mined solution.
+func (m *Miner) Submit(jobID, nonce, result string) error {
+	request := map[string]interface{}{
+		"id":     3,
+		"method": "mining.submit",
+		"params": []interface{}{m.ID, jobID, nonce, result},
+	}
+	return m.sendRequest(request)
+}
+
+// send request sends request to the server.
+func (m *Miner) sendRequest(request map[string]interface{}) error {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	_, err = m.Conn.Write(data)
+	return err
+}
+
+func main() {
+	miner := NewMiner("Shuccck", "localhost", 3333)
+	err := miner.Connect()
+	if err != nil {
+		log.Fatalf("Error connecting to server: %v", err)
+	}
+	defer miner.Conn.Close()
+
+	err = miner.Subscribe()
+	if err != nil {
+		log.Fatalf("Error subscribing: %v", err)
+	}
+
+	err = miner.Authorize()
+	if err != nil {
+		log.Fatalf("Error authorizing: %v", err)
+	}
+
+	miner.Start()
 }
